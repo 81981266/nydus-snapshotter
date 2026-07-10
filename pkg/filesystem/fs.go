@@ -42,6 +42,7 @@ import (
 	"github.com/containerd/nydus-snapshotter/pkg/stargz"
 	"github.com/containerd/nydus-snapshotter/pkg/tarfs"
 	"github.com/containerd/nydus-snapshotter/pkg/utils/erofs"
+	mountutils "github.com/containerd/nydus-snapshotter/pkg/utils/mount"
 )
 
 type Filesystem struct {
@@ -763,6 +764,16 @@ func (fs *Filesystem) decideDaemonMountpoint(fsDriver string, isSharedDaemonMode
 			m = fs.rootMountpoint
 		} else {
 			m = path.Join(rafs.GetSnapshotDir(), "mnt")
+		}
+		// A nydusd that exited without unmounting (e.g. failed during startup)
+		// leaves a dead FUSE mount here, which fails MkdirAll with "file exists"
+		// and blocks every following mount attempt. Detach it first.
+		if detached, derr := mountutils.DetachIfDeadMount(m); detached {
+			if derr != nil {
+				log.L.WithError(derr).Warnf("Failed to detach dead FUSE mount at %s", m)
+			} else {
+				log.L.Warnf("Detached dead FUSE mount at %s left by an exited nydusd", m)
+			}
 		}
 		if err := os.MkdirAll(m, 0755); err != nil {
 			return "", errors.Wrapf(err, "create directory %s", m)

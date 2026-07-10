@@ -32,11 +32,34 @@ func (m *Mounter) Umount(target string) error {
 			return errors.New("not mounted")
 		}
 	} else {
+		// A dead FUSE mount (the daemon exited without unmounting) fails the
+		// mountpoint check with ENOTCONN before the mount table is even
+		// consulted. Only a lazy detach can remove such a mount.
+		if errors.Is(err, syscall.ENOTCONN) {
+			return syscall.Unmount(target, syscall.MNT_DETACH)
+		}
 		return err
 	}
 
 	// return syscall.Unmount(target, syscall.MNT_FORCE)
 	return syscall.Unmount(target, 0)
+}
+
+// DetachIfDeadMount detects a dead FUSE mount at path - a mount whose FUSE
+// daemon exited without unmounting, so stat(2) on it fails with ENOTCONN
+// ("transport endpoint is not connected") - and lazily detaches it so that
+// the path becomes a regular directory again. It returns true if a dead
+// mount was detected, no matter whether the detach succeeded.
+func DetachIfDeadMount(path string) (bool, error) {
+	if _, err := os.Stat(path); err == nil || !errors.Is(err, syscall.ENOTCONN) {
+		return false, nil
+	}
+
+	if err := syscall.Unmount(path, syscall.MNT_DETACH); err != nil {
+		return true, errors.Wrapf(err, "lazily detach dead mount %s", path)
+	}
+
+	return true, nil
 }
 
 func NormalizePath(path string) (realPath string, err error) {

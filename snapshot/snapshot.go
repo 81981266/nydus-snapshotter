@@ -40,6 +40,7 @@ import (
 	"github.com/containerd/nydus-snapshotter/pkg/referrer"
 	"github.com/containerd/nydus-snapshotter/pkg/system"
 	"github.com/containerd/nydus-snapshotter/pkg/tarfs"
+	mountutils "github.com/containerd/nydus-snapshotter/pkg/utils/mount"
 
 	"github.com/containerd/nydus-snapshotter/pkg/store"
 
@@ -1271,6 +1272,17 @@ func (o *snapshotter) cleanupSnapshotDirectory(ctx context.Context, dir string) 
 	if o.fs.TarfsEnabled() {
 		if err := o.fs.DetachTarfsLayer(snapshotID); err != nil && !os.IsNotExist(err) {
 			log.G(ctx).WithError(err).Errorf("failed to detach tarfs layer for snapshot %s", snapshotID)
+		}
+	}
+
+	// A nydusd that exited without unmounting leaves a dead FUSE mount at
+	// <dir>/mnt. os.RemoveAll would fail on it and leak the whole snapshot
+	// directory together with the dead mount. Detach it first.
+	if detached, err := mountutils.DetachIfDeadMount(filepath.Join(dir, "mnt")); detached {
+		if err != nil {
+			log.G(ctx).WithError(err).Warnf("failed to detach dead FUSE mount under %s", dir)
+		} else {
+			log.G(ctx).Infof("detached dead FUSE mount under %s", dir)
 		}
 	}
 
