@@ -294,7 +294,16 @@ func (m *Manager) DestroyDaemon(d *daemon.Daemon) error {
 
 func (m *Manager) cleanUpDaemonResources(d *daemon.Daemon) {
 	// TODO: use recycle bin to stage directories/files to be deleted.
-	resource := []string{d.States.ConfigDir, d.States.LogDir}
+	var resource []string
+	if d.State() == types.DaemonStateRunning {
+		resource = append(resource, d.States.ConfigDir, d.States.LogDir)
+	} else {
+		// The daemon never reached the RUNNING state, so its config and log
+		// directories hold the only evidence of why it failed. Keep them for
+		// postmortem instead of destroying the scene.
+		log.L.Infof("Daemon %s did not reach RUNNING state, keeping config dir %s and log dir %s for debugging",
+			d.ID(), d.States.ConfigDir, d.States.LogDir)
+	}
 	if !d.IsSharedDaemon() {
 		socketDir := path.Dir(d.GetAPISock())
 		resource = append(resource, socketDir)
