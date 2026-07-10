@@ -515,21 +515,51 @@ func (fs *Filesystem) copyBlobMetaFiles(bootstrap, cacheDir string) error {
 		fileName := filepath.Base(srcPath)
 		dstPath := filepath.Join(cacheDir, fileName)
 
-		if err := os.Link(srcPath, dstPath); err != nil {
-			log.L.Warnf("Failed to create hardlink for %s: %v, falling back to copy", fileName, err)
-			if err := fs.copyFile(srcPath, dstPath); err != nil {
-				return errors.Wrapf(err, "copy blob meta file %s", fileName)
-			}
-			log.L.Debugf("Copied blob meta file: %s -> %s", srcPath, dstPath)
-		} else {
+		err := os.Link(srcPath, dstPath)
+		if err == nil {
 			log.L.Debugf("Created hardlink for blob meta: %s -> %s", srcPath, dstPath)
+			continue
 		}
+
+		if os.IsExist(err) {
+			srcInfo, srcErr := os.Stat(srcPath)
+			dstInfo, dstErr := os.Stat(dstPath)
+			if srcErr == nil && dstErr == nil && os.SameFile(srcInfo, dstInfo) {
+				// Already hardlinked into the cache by a previous mount, nothing
+				// to do. Never fall through to copyFile here: opening dst with
+				// O_TRUNC would truncate the shared inode and destroy srcPath too.
+				log.L.Debugf("Blob meta %s already hardlinked to cache, skipped", fileName)
+				continue
+			}
+			// dst exists but is a different file, replace it with a fresh hardlink.
+			if rmErr := os.Remove(dstPath); rmErr != nil {
+				log.L.Warnf("Failed to remove stale blob meta %s: %v", dstPath, rmErr)
+			} else if err = os.Link(srcPath, dstPath); err == nil {
+				log.L.Debugf("Created hardlink for blob meta: %s -> %s", srcPath, dstPath)
+				continue
+			}
+		}
+
+		log.L.Warnf("Failed to create hardlink for %s: %v, falling back to copy", fileName, err)
+		if err := fs.copyFile(srcPath, dstPath); err != nil {
+			return errors.Wrapf(err, "copy blob meta file %s", fileName)
+		}
+		log.L.Debugf("Copied blob meta file: %s -> %s", srcPath, dstPath)
 	}
 
 	return nil
 }
 
 func (fs *Filesystem) copyFile(src, dst string) error {
+	// Refuse to copy a file onto itself, e.g. when src and dst are hardlinks of
+	// the same inode: os.Create would truncate the shared inode and destroy the
+	// source before io.Copy reads a single byte.
+	if srcInfo, err := os.Stat(src); err == nil {
+		if dstInfo, err := os.Stat(dst); err == nil && os.SameFile(srcInfo, dstInfo) {
+			return nil
+		}
+	}
+
 	source, err := os.Open(src)
 	if err != nil {
 		return err
