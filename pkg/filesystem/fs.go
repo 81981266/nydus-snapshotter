@@ -67,7 +67,7 @@ const (
 	// recovery leaves the daemon permanently unreachable: no other code path
 	// (kubelet's CreateContainer retries, the periodic metrics collector) ever
 	// attempts to restart it, they only poll its already-known-dead state.
-	daemonRecoverMaxAttempts = 5
+	daemonRecoverMaxAttempts = 50
 	daemonRecoverRetryDelay  = 500 * time.Millisecond
 )
 
