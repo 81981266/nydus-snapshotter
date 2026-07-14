@@ -106,6 +106,14 @@ func IsMountpoint(path string) (bool, error) {
 
 func WaitUntilUnmounted(path string) error {
 	return retry.Do(func() error {
+		// A dead FUSE mount (the daemon exited without unmounting) never becomes
+		// "unmounted" on its own: stat(2) on it keeps failing with ENOTCONN
+		// forever, so blindly waiting and giving up (as below) leaves it behind
+		// permanently. Detach it immediately instead.
+		if detached, err := DetachIfDeadMount(path); detached {
+			return err
+		}
+
 		mounted, err := IsMountpoint(path)
 		if err != nil {
 			return err
