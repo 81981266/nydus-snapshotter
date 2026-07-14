@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -59,6 +60,16 @@ type Filesystem struct {
 	rootMountpoint      string
 	snapshotMutexMap    sync.Map
 }
+
+const (
+	// A nydusd startup can fail transiently (e.g. the FUSE-mount-then-stat
+	// ENOTCONN startup race). Without retrying, a single failed attempt during
+	// recovery leaves the daemon permanently unreachable: no other code path
+	// (kubelet's CreateContainer retries, the periodic metrics collector) ever
+	// attempts to restart it, they only poll its already-known-dead state.
+	daemonRecoverMaxAttempts = 5
+	daemonRecoverRetryDelay  = 500 * time.Millisecond
+)
 
 // NewFileSystem initialize Filesystem instance
 // It does mount image layers by starting nydusd doing FUSE mount or not.
@@ -134,25 +145,54 @@ func NewFileSystem(ctx context.Context, opt ...NewFSOpt) (*Filesystem, error) {
 	for _, d := range recoveringDaemons {
 		d := d
 		egRecover.Go(func() error {
-			d.ClearVestige()
 			fsManager, err := fs.getManager(d.States.FsDriver)
 			if err != nil {
 				log.L.Warnf("Failed to get filesystem manager for daemon %s, skipping recovery: %v", d.States.ID, err)
 				return nil
 			}
-			if err := fsManager.StartDaemon(d); err != nil {
-				log.L.Warnf("Failed to start daemon %s during recovery, skipping: %v", d.ID(), err)
+
+			var lastErr error
+			for attempt := 1; attempt <= daemonRecoverMaxAttempts; attempt++ {
+				d.ClearVestige()
+
+				if err := fsManager.StartDaemon(d); err != nil {
+					lastErr = err
+					log.L.Warnf("Failed to start daemon %s during recovery (attempt %d/%d): %v",
+						d.ID(), attempt, daemonRecoverMaxAttempts, err)
+					time.Sleep(daemonRecoverRetryDelay)
+					continue
+				}
+
+				if err := d.WaitUntilState(types.DaemonStateRunning); err != nil {
+					lastErr = err
+					log.L.Warnf("Daemon %s did not become running during recovery (attempt %d/%d): %v",
+						d.ID(), attempt, daemonRecoverMaxAttempts, err)
+					// The nydusd process was spawned but never became healthy. Terminate
+					// and reap it before retrying: otherwise every failed attempt leaks a
+					// zombie process, and since nothing else will ever retry this daemon,
+					// leaving it running (or defunct) here is how a single failed startup
+					// turns into a permanently stuck daemon.
+					if terr := d.Terminate(); terr != nil {
+						log.L.Warnf("Failed to terminate daemon %s after failed recovery attempt: %v", d.ID(), terr)
+					}
+					if werr := d.Wait(); werr != nil {
+						log.L.Warnf("Failed to wait for daemon %s to exit after failed recovery attempt: %v", d.ID(), werr)
+					}
+					d.ResetState()
+					time.Sleep(daemonRecoverRetryDelay)
+					continue
+				}
+
+				if err := d.RecoverRafsInstances(); err != nil {
+					log.L.Warnf("Failed to recover mounts for daemon %s, skipping: %v", d.ID(), err)
+					return nil
+				}
+				fs.TryRetainSharedDaemon(d)
 				return nil
 			}
-			if err := d.WaitUntilState(types.DaemonStateRunning); err != nil {
-				log.L.Warnf("Failed to wait for daemon %s to become running, skipping: %v", d.ID(), err)
-				return nil
-			}
-			if err := d.RecoverRafsInstances(); err != nil {
-				log.L.Warnf("Failed to recover mounts for daemon %s, skipping: %v", d.ID(), err)
-				return nil
-			}
-			fs.TryRetainSharedDaemon(d)
+
+			log.L.Errorf("Daemon %s failed to become running after %d recovery attempts, giving up: %v",
+				d.ID(), daemonRecoverMaxAttempts, lastErr)
 			return nil
 		})
 	}
