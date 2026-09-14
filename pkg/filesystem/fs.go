@@ -637,8 +637,15 @@ func (fs *Filesystem) Umount(_ context.Context, snapshotID string) error {
 	case config.FsDriverFscache, config.FsDriverFusedev:
 		daemon, err := fs.getDaemonByRafs(rafs)
 		if err != nil {
+			// The daemon record is gone while the RAFS instance still references it.
+			// DestroyDaemon deletes the daemon record first and only then unmounts,
+			// so any failure in between leaves exactly this state. Bailing out here
+			// means the FUSE mount is never dropped: the snapshot directory can not
+			// be removed ("device or resource busy") and every following cleanup
+			// round repeats the same failure forever. The daemon API is not needed
+			// to drop a mount, so unmount it directly instead.
 			log.L.Debugf("snapshot %s has no associated nydusd", snapshotID)
-			return errors.Wrapf(err, "get daemon with ID %s for snapshot %s", rafs.DaemonID, snapshotID)
+			return fs.umountOrphanedRafsInstance(fsManager, rafs, snapshotID)
 		}
 
 		daemon.RemoveRafsInstance(snapshotID)
@@ -673,6 +680,52 @@ func (fs *Filesystem) Umount(_ context.Context, snapshotID string) error {
 	}
 
 	return nil
+}
+
+// umountOrphanedRafsInstance drops a RAFS instance whose daemon record no longer
+// exists. There is no daemon left to talk to, so the mountpoint is unmounted
+// directly and the instance records are cleared, which lets the caller (snapshot
+// cleanup) finally remove the snapshot directory.
+//
+// Every step is logged with the snapshot ID, the vanished daemon ID and the
+// mountpoint, so that this recovery is visible in the logs rather than silent.
+func (fs *Filesystem) umountOrphanedRafsInstance(fsManager *manager.Manager, rafs *racache.Rafs, snapshotID string) error {
+	mountpoint := rafs.GetMountpoint()
+	log.L.Warnf("[OrphanUmount] snapshot %s references daemon %s which no longer exists, unmounting %q directly",
+		snapshotID, rafs.DaemonID, mountpoint)
+
+	var umountErr error
+	if mountpoint == "" {
+		log.L.Warnf("[OrphanUmount] snapshot %s (daemon %s) has no recorded mountpoint, nothing to unmount",
+			snapshotID, rafs.DaemonID)
+	} else {
+		lazy, err := mountutils.UmountWithLazyFallback(mountpoint)
+		switch {
+		case err != nil:
+			umountErr = errors.Wrapf(err, "umount orphaned mountpoint %s of snapshot %s", mountpoint, snapshotID)
+			log.L.WithError(err).Errorf("[OrphanUmount] failed to unmount %s of snapshot %s (daemon %s), the snapshot directory will stay behind",
+				mountpoint, snapshotID, rafs.DaemonID)
+		case lazy:
+			log.L.Warnf("[OrphanUmount] lazily detached %s of snapshot %s (daemon %s), a normal umount was refused",
+				mountpoint, snapshotID, rafs.DaemonID)
+		default:
+			log.L.Infof("[OrphanUmount] unmounted %s of snapshot %s (daemon %s)",
+				mountpoint, snapshotID, rafs.DaemonID)
+		}
+	}
+
+	// Drop the stale records even when the unmount failed, otherwise this instance
+	// keeps pointing at a daemon that will never come back and every cleanup round
+	// walks into the same dead end.
+	if err := fsManager.RemoveRafsInstance(snapshotID); err != nil {
+		log.L.WithError(err).Warnf("[OrphanUmount] failed to remove RAFS instance %s (daemon %s) from the store",
+			snapshotID, rafs.DaemonID)
+	}
+	racache.RafsGlobalCache.Remove(snapshotID)
+	log.L.Infof("[OrphanUmount] cleared RAFS instance %s that referenced the vanished daemon %s",
+		snapshotID, rafs.DaemonID)
+
+	return umountErr
 }
 
 // How much space the layer/blob cache filesystem is occupying

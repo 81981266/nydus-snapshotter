@@ -62,6 +62,43 @@ func DetachIfDeadMount(path string) (bool, error) {
 	return true, nil
 }
 
+// UmountWithLazyFallback unmounts target, falling back to a lazy detach
+// (MNT_DETACH) when a normal unmount is refused - for example because the mount
+// is still busy, or because its FUSE daemon is gone and the mount is dead.
+//
+// The returned bool reports whether the lazy detach was needed, so that callers
+// can log which path was actually taken.
+func UmountWithLazyFallback(target string) (bool, error) {
+	mounted, err := IsMountpoint(target)
+	if err != nil {
+		// A dead FUSE mount (the daemon exited without unmounting) fails the
+		// mountpoint check with ENOTCONN before the mount table is consulted.
+		// Only a lazy detach can remove such a mount.
+		if errors.Is(err, syscall.ENOTCONN) {
+			return true, syscall.Unmount(target, syscall.MNT_DETACH)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if !mounted {
+		return false, nil
+	}
+
+	uerr := syscall.Unmount(target, 0)
+	if uerr == nil {
+		return false, nil
+	}
+
+	if derr := syscall.Unmount(target, syscall.MNT_DETACH); derr != nil {
+		return true, errors.Wrapf(derr, "lazily detach %s after normal umount failed (%v)", target, uerr)
+	}
+
+	return true, nil
+}
+
 func NormalizePath(path string) (realPath string, err error) {
 	if realPath, err = filepath.Abs(path); err != nil {
 		return "", errors.Wrapf(err, "get absolute path for %s", path)
