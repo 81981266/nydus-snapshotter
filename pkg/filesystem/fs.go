@@ -959,6 +959,31 @@ func (fs *Filesystem) decideDaemonMountpoint(fsDriver string, isSharedDaemonMode
 			} else {
 				log.L.Warnf("Detached dead FUSE mount at %s left by an exited nydusd", m)
 			}
+		} else if !isSharedDaemonMode {
+			// The leftover mount is not necessarily dead: an orphaned nydusd whose
+			// snapshotter record is gone keeps serving it, so the detach above does
+			// not fire. Mounting a new nydusd on top of such a mount is a plausible
+			// source of the ENOTCONN the new daemon then hits when it stat(2)s its
+			// own mountpoint. This path is only reached when the snapshotter holds
+			// no RAFS instance for the snapshot, so anything still mounted here is
+			// orphaned and safe to drop.
+			//
+			// Only for a dedicated daemon: in shared mode this is the shared root
+			// mountpoint, which may legitimately be in use.
+			if mounted, merr := mountutils.IsMountpoint(m); merr != nil {
+				log.L.WithError(merr).Debugf("[StaleMountCleanup] could not tell whether %s is still mounted", m)
+			} else if mounted {
+				lazy, uerr := mountutils.UmountWithLazyFallback(m)
+				switch {
+				case uerr != nil:
+					log.L.WithError(uerr).Warnf("[StaleMountCleanup] failed to drop the stale mount at %s left by an orphaned nydusd, starting a new daemon on top of it may fail",
+						m)
+				case lazy:
+					log.L.Warnf("[StaleMountCleanup] lazily detached the stale mount at %s left by an orphaned nydusd before starting a new daemon", m)
+				default:
+					log.L.Warnf("[StaleMountCleanup] unmounted the stale mount at %s left by an orphaned nydusd before starting a new daemon", m)
+				}
+			}
 		}
 		if err := os.MkdirAll(m, 0755); err != nil {
 			return "", errors.Wrapf(err, "create directory %s", m)
