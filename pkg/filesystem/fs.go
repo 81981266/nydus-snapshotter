@@ -69,6 +69,22 @@ const (
 	// attempts to restart it, they only poll its already-known-dead state.
 	daemonRecoverMaxAttempts = 50
 	daemonRecoverRetryDelay  = 500 * time.Millisecond
+
+	// The same startup race hits freshly created daemons, but nothing retries
+	// those: Mount starts nydusd once and fails the whole container creation as
+	// soon as it does not reach RUNNING. Retry here as well, so that a transient
+	// startup failure costs a couple of seconds instead of a failed
+	// CreateContainer, a DestroyDaemon round and a kubelet backoff.
+	//
+	// Keep the attempt count bounded: this blocks CreateContainer, and every
+	// failed attempt burns a full WaitUntilState timeout (~2s). Five attempts
+	// bound the worst case at roughly 11s while pushing the covered fraction of
+	// the race close to its ceiling - at the ~85% per-attempt success rate
+	// observed in production that is >99.99% (0.15^5 ~= 0.0076% left
+	// uncovered). Beyond that the failure is unlikely to be transient, and
+	// falling back to kubelet's own CreateContainer retry is the better answer.
+	daemonStartMaxAttempts = 5
+	daemonStartRetryDelay  = 200 * time.Millisecond
 )
 
 // NewFileSystem initialize Filesystem instance
@@ -141,6 +157,12 @@ func NewFileSystem(ctx context.Context, opt ...NewFSOpt) (*Filesystem, error) {
 	}
 
 	// Try to bring all persisted and stopped nydusd up and remount Rafs
+	// Report the daemon startup resilience settings once at boot, so that after a
+	// rollout it is possible to tell from the logs alone which behaviour a node is
+	// running, without having to wait for a failure to show up.
+	log.L.Infof("[DaemonStartRetry] daemon startup retry enabled: new daemons %d attempts every %s, recovered daemons %d attempts every %s",
+		daemonStartMaxAttempts, daemonStartRetryDelay, daemonRecoverMaxAttempts, daemonRecoverRetryDelay)
+
 	egRecover, _ := errgroup.WithContext(context.Background())
 	for _, d := range recoveringDaemons {
 		d := d
@@ -517,8 +539,8 @@ func (fs *Filesystem) Mount(ctx context.Context, snapshotID string, labels map[s
 
 	// Wait for the daemon to be ready before persisting the RAFS instance
 	if err == nil && (fsDriver == config.FsDriverFscache || fsDriver == config.FsDriverFusedev) {
-		if err := d.WaitUntilState(types.DaemonStateRunning); err != nil {
-			return errors.Wrapf(err, "daemon %s failed to reach RUNNING for snapshot %s", d.ID(), snapshotID)
+		if werr := fs.waitUntilDaemonRunning(fsManager, d, snapshotID, useSharedDaemon); werr != nil {
+			return werr
 		}
 	}
 
@@ -680,6 +702,76 @@ func (fs *Filesystem) Umount(_ context.Context, snapshotID string) error {
 	}
 
 	return nil
+}
+
+// waitUntilDaemonRunning waits for a just-started daemon to reach RUNNING and,
+// for a dedicated daemon, restarts it a bounded number of times when it does
+// not get there.
+//
+// nydusd has a startup race: the FUSE mount and the FUSE INIT handshake both
+// succeed, then nydusd stat(2)s its own mountpoint, gets ENOTCONN ("Socket not
+// connected") and exits. The recovery path already retries around it, but a
+// freshly created daemon had no retry at all, so a single hit failed the whole
+// CreateContainer, burnt the RUNNING timeout, and forced a DestroyDaemon round
+// plus a kubelet backoff before anything was tried again. Retrying here also
+// keeps the daemon out of DestroyDaemon, which is where a failure can strand a
+// RAFS instance without its daemon.
+//
+// A shared daemon serves other snapshots too, so restarting it underneath them
+// is not safe: report the failure to the caller as before.
+func (fs *Filesystem) waitUntilDaemonRunning(fsManager *manager.Manager, d *daemon.Daemon, snapshotID string, useSharedDaemon bool) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= daemonStartMaxAttempts; attempt++ {
+		lastErr = d.WaitUntilState(types.DaemonStateRunning)
+		if lastErr == nil {
+			if attempt > 1 {
+				log.L.Infof("[DaemonStartRetry] daemon %s reached RUNNING for snapshot %s on attempt %d/%d, pid %d, mountpoint %s",
+					d.ID(), snapshotID, attempt, daemonStartMaxAttempts, d.Pid(), d.HostMountpoint())
+			}
+			return nil
+		}
+
+		if useSharedDaemon {
+			return errors.Wrapf(lastErr, "daemon %s failed to reach RUNNING for snapshot %s", d.ID(), snapshotID)
+		}
+		if attempt == daemonStartMaxAttempts {
+			break
+		}
+
+		log.L.Warnf("[DaemonStartRetry] daemon %s did not reach RUNNING for snapshot %s (attempt %d/%d), pid %d, mountpoint %s: %v",
+			d.ID(), snapshotID, attempt, daemonStartMaxAttempts, d.Pid(), d.HostMountpoint(), lastErr)
+
+		// The nydusd process was spawned but never became healthy. Terminate and
+		// reap it before retrying, otherwise every failed attempt leaks a process
+		// and the dead FUSE mount it left behind.
+		if terr := d.Terminate(); terr != nil {
+			log.L.WithError(terr).Warnf("[DaemonStartRetry] failed to terminate daemon %s (pid %d) after attempt %d",
+				d.ID(), d.Pid(), attempt)
+		}
+		if werr := d.Wait(); werr != nil {
+			log.L.WithError(werr).Warnf("[DaemonStartRetry] failed to reap daemon %s (pid %d) after attempt %d",
+				d.ID(), d.Pid(), attempt)
+		}
+		d.ResetState()
+		d.ClearVestige()
+		time.Sleep(daemonStartRetryDelay)
+
+		if serr := fsManager.StartDaemon(d); serr != nil {
+			lastErr = serr
+			log.L.WithError(serr).Warnf("[DaemonStartRetry] failed to restart daemon %s for snapshot %s (attempt %d/%d)",
+				d.ID(), snapshotID, attempt+1, daemonStartMaxAttempts)
+			continue
+		}
+		log.L.Infof("[DaemonStartRetry] restarted daemon %s for snapshot %s (attempt %d/%d), new pid %d, mountpoint %s",
+			d.ID(), snapshotID, attempt+1, daemonStartMaxAttempts, d.Pid(), d.HostMountpoint())
+	}
+
+	log.L.Errorf("[DaemonStartRetry] daemon %s failed to reach RUNNING for snapshot %s after %d attempts, giving up: %v",
+		d.ID(), snapshotID, daemonStartMaxAttempts, lastErr)
+
+	return errors.Wrapf(lastErr, "daemon %s failed to reach RUNNING for snapshot %s after %d attempts",
+		d.ID(), snapshotID, daemonStartMaxAttempts)
 }
 
 // umountOrphanedRafsInstance drops a RAFS instance whose daemon record no longer
